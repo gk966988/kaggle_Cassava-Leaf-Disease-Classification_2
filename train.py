@@ -1,0 +1,275 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import os, sys
+import time
+import logging
+import warnings
+from tqdm import tqdm
+from torch.utils.data import DataLoader
+from torch.utils.data.sampler import SubsetRandomSampler
+
+from config import Config
+from models.net import get_net, efficientnet
+from dataset.dataset import FGVC7Data
+from utils.utils import CenterLoss, AverageMeter, TopKAccuracyMetric, ModelCheckpoint, batch_augment, get_transform
+from utils.loss import *
+
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--datasets', default=r'../data/cassava-leaf-disease-classification', help='Train Dataset directory path')
+parser.add_argument('--net', default='b0', help='Choose net to use')
+parser.add_argument('--bs', default=32, type=int,  help='batch size')
+parser.add_argument('--ckpt', default=None, type=str, help='resume train')
+parser.add_argument('--epochs', default=100, type=int,  help='epoch size')
+parser.add_argument('--loss', default='all', type=str, help='choose loss')
+args = parser.parse_args()
+
+config = Config()
+#others
+config.batch_size = args.bs
+config.net = args.net
+config.ckpt = args.ckpt
+config.epochs = args.epochs
+config.refresh()
+
+# GPU settings
+assert torch.cuda.is_available()
+os.environ['CUDA_VISIBLE_DEVICES'] = config.GPU
+device = torch.device("cuda")
+torch.backends.cudnn.benchmark = True
+
+# General loss functions
+ce_weight = 1.0
+arc_weight = 0
+if args.loss == 'all':
+    ce_weight = arc_weight = 0.5
+elif args.loss == 'ce':
+    ce_weight = 1.0
+    arc_weight = 0
+elif args.loss == 'arc' :
+    ce_weight = 0
+    arc_weight = 1.0
+criterion = Criterion(weight_arcface=arc_weight, weight_ce=ce_weight)
+# loss and metric
+loss_container = AverageMeter(name='loss')
+raw_metric = TopKAccuracyMetric(topk=(1,2))
+num_classes = 5
+
+
+def main(model_name):
+    ##################################
+    # Initialize saving directory
+    ##################################
+    if not os.path.exists(config.save_dir):
+        os.makedirs(config.save_dir)
+
+    ##################################
+    # Logging setting
+    ##################################
+    logging.basicConfig(stream=sys.stdout, level=logging.INFO,                           # 设置输出级别
+                        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+    ##################################
+    # Load dataset  TODO: 10-fold cross validation
+    ##################################
+    train_dataset = FGVC7Data(root=args.datasets, phase='train', transform=get_transform(config.image_size, 'train'))
+    indices = range(len(train_dataset))
+    split = int(0.3 * len(train_dataset))
+    train_indices = indices[split:]
+    test_indices = indices[:split]
+    #train_sampler = SubsetRandomSampler(train_indices)
+    valid_sampler = SubsetRandomSampler(test_indices)
+
+    train_loader  = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True,
+                                               num_workers=config.workers, pin_memory=True)
+    validate_loader = DataLoader(train_dataset, batch_size=config.batch_size, sampler=valid_sampler,
+                              num_workers=config.workers, pin_memory=True)
+
+    num_classes = 4
+    print('Train Size: {}'.format(len(train_indices)))
+    print('Valid Size: {}'.format(len(test_indices)))
+    ##################################
+    # Initialize model
+    ##################################
+    logs = {}   # 有 lr, epoch, val_loss
+    start_epoch = 0
+    num_classes = 5
+    net = efficientnet(net_name=model_name, num_classes=num_classes, weight_path='github')
+
+    if config.ckpt:
+        # Load ckpt and get state_dict
+        checkpoint = torch.load(config.ckpt)
+
+        # Get epoch and some logs
+        logs = checkpoint['logs']
+        start_epoch = int(logs['epoch'])
+        # Load weights
+        state_dict = checkpoint['state_dict']
+        net.load_state_dict(state_dict)
+        logging.info('Network loaded from {}'.format(config.ckpt))
+        #net.re_init()
+    logging.info('Network weights save to {}'.format(config.save_dir))
+
+    ##################################
+    # Use cuda
+    ##################################
+    net.to(device)
+    if torch.cuda.device_count() > 1:
+        net = nn.DataParallel(net)
+
+    ##################################
+    # Optimizer, LR Schedulerextract_features(img)
+    ##################################
+    learning_rate = logs['lr'] if 'lr' in logs else config.learning_rate
+    #optimizer = torch.optim.SGD(net.parameters(), lr=learning_rate, momentum=0.9, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(net.parameters(),lr=learning_rate, amsgrad=True)
+    #scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.9, patience=2)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, config.epochs, eta_min = 1e-6)
+
+    ##################################
+    # ModelCheckpoint
+    ##################################
+    callback_monitor = 'val_{}'.format(raw_metric.name)    #  topk_accuracy
+    callback = ModelCheckpoint(savepath=os.path.join(config.save_dir, config.model_name),
+                               monitor=callback_monitor,
+                               mode='max')
+    if callback_monitor in logs:
+        callback.set_best_score(logs[callback_monitor])
+    else:
+        callback.reset()
+
+        ##################################
+        # TRAINING
+        ##################################
+    logging.info('Start training: Total epochs: {}, Batch size: {}, Training size: {}, Validation size: {}'.
+                 format(config.epochs, config.batch_size, len(train_indices), len(test_indices)))
+    logging.info('')
+
+    for epoch in range(start_epoch, config.epochs):
+        callback.on_epoch_begin()
+
+        logs['epoch'] = epoch + 1
+        logs['lr'] = optimizer.param_groups[0]['lr']
+
+        logging.info('Epoch {:03d}, LR {:g}'.format(epoch + 1, optimizer.param_groups[0]['lr']))
+        # 每一个epoch都显示一个进度条
+        pbar = tqdm(total=len(train_loader), unit='batches')      # unit 表示迭代速度的单位
+        pbar.set_description('Epoch {}/{}'.format(epoch + 1, config.epochs))
+
+        train(logs=logs,
+              data_loader=train_loader,
+              net=net,
+              optimizer=optimizer,
+              pbar=pbar)
+        validate(logs=logs,
+                 data_loader=validate_loader,
+                 net=net,
+                 pbar=pbar)
+
+        if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(logs['val_loss'])
+        else:
+            scheduler.step(epoch)
+
+        callback.on_epoch_end(logs, net)
+        pbar.close()
+
+def train(**kwargs):
+    # Retrieve training configuration
+    logs = kwargs['logs']
+    data_loader = kwargs['data_loader']
+    net = kwargs['net']
+    optimizer = kwargs['optimizer']
+    pbar = kwargs['pbar']
+
+    # metrics initialization
+    loss_container.reset()
+    raw_metric.reset()   # TopKAccuracyMetric
+
+    # begin training
+    start_time = time.time()
+    net.train()
+    for i, (X, y) in enumerate(data_loader):
+        optimizer.zero_grad()
+
+        # obtain data for training
+        X = X.to(device)
+        y = y.to(device)
+        out = net(X)
+        # loss
+        batch_loss = criterion(out, y, X)
+
+        # backward
+        batch_loss.backward()
+        optimizer.step()
+
+        # metrics: loss and top-1,5 error
+        with torch.no_grad():
+            y_pred_raw = out[0]
+            epoch_loss = loss_container(batch_loss.item())
+            epoch_raw_acc = raw_metric(y_pred_raw, y)
+
+        # end of this batch
+        batch_info = 'Loss {:.4f}, Raw Acc ({:.2f} {:.2f})'.format(
+            epoch_loss, epoch_raw_acc[0], epoch_raw_acc[1])
+        pbar.update()
+        pbar.set_postfix_str(batch_info)      # 在进度条后显示
+
+    # end of this epoch
+    logs['train_{}'.format(loss_container.name)] = epoch_loss    # train_loss
+    logs['train_raw_{}'.format(raw_metric.name)] = epoch_raw_acc    # topk_accuracy
+    logs['train_info'] = batch_info
+    end_time = time.time()
+
+    # write log for this epoch
+    logging.info('Train: {}, Time {:3.2f}'.format(batch_info, end_time - start_time))
+
+def validate(**kwargs):
+    # Retrieve training configuration
+    logs = kwargs['logs']
+    data_loader = kwargs['data_loader']
+    net = kwargs['net']
+    pbar = kwargs['pbar']
+
+    # metrics initialization
+    loss_container.reset()
+    raw_metric.reset()
+
+    # begin validation
+    start_time = time.time()
+    net.eval()
+    with torch.no_grad():
+        for i, (X, y) in enumerate(data_loader):
+            # obtain data
+            X = X.to(device)
+            y = y.to(device)
+
+            ##################################
+            # Raw Image
+            ##################################
+            y_pred , y_arc = net(X)
+            # loss
+            print('y_pred', y_pred.shape, 'y_arc', y_arc.shape)
+            batch_loss = criterion.ce_forward(y_pred, y)
+            #batch_loss = criterion.arc_forward(y_arc, y)
+            epoch_loss = loss_container(batch_loss.item())
+
+            # metrics: top-1,5 error
+            epoch_acc = raw_metric(y_pred, y)
+    # end of validation
+    logs['val_{}'.format(loss_container.name)] = epoch_loss
+    logs['val_{}'.format(raw_metric.name)] = epoch_acc
+    end_time = time.time()
+
+    batch_info = 'Val Loss {:.4f}, Val Acc ({:.2f}, {:.2f})'.format(epoch_loss, epoch_acc[0], epoch_acc[1])
+    pbar.set_postfix_str('{}, {}'.format(logs['train_info'], batch_info))
+
+    # write log for this epoch
+    logging.info('Valid: {}, Time {:3.2f}'.format(batch_info, end_time - start_time))
+    logging.info('')
+
+
+if __name__ == '__main__':
+    main('efficientnet-b0')
