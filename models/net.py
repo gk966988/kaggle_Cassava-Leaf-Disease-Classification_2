@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from flyai.utils import remote_helper
 from models.efficientnet_pytorch.model import EfficientNet
 from models.modelzoo.senet2 import seresnet34
 from models.modelzoo.inceptionresnetv2 import inceptionresnetv2
