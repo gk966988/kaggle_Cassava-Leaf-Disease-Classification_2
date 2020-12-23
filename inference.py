@@ -75,6 +75,7 @@ def main():
     preds = []
     image_name = []
     with torch.no_grad():
+        net.eval()
         pbar = tqdm(total=len(test_loader), unit=' batches')
         pbar.set_description('Validation')
         for i, input in enumerate(test_loader):
