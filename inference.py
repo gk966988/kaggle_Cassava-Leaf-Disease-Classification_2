@@ -12,7 +12,7 @@ from tqdm import tqdm
 from torch.nn import functional as F
 # parser = argparse.ArgumentParser()
 # parser.add_argument('--datasets', default='./data/', help='Train Dataset directory path')
-# parser.add_argument('--net', default='b0', help='Choose net to use')
+# parser.add_argument('--net', default='b4', help='Choose net to use')
 # args = parser.parse_args()
 config = Config()
 # config.net = args.net
@@ -54,7 +54,7 @@ def main():
     warnings.filterwarnings("ignore")
 
     try:
-        ckpt = '../input/222222/weights/model_b0_384.ckpt'
+        ckpt = '../input/222222/weights/model_b4_386.ckpt'
     except:
         print('Set ckpt for evaluation in config.py')
         return
