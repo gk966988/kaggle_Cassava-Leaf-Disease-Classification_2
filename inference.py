@@ -46,7 +46,7 @@ num_classes = 5
 datasets = '/kaggle/input/cassava-leaf-disease-classification'
 
 batch_size, num_workers = 1, 4
-net_name = 'efficientnet-b0'
+net_name = 'efficientnet-b2'
 def main():
     logging.basicConfig(
         format='%(asctime)s: %(levelname)s: [%(filename)s:%(lineno)d]: %(message)s',
@@ -54,7 +54,7 @@ def main():
     warnings.filterwarnings("ignore")
 
     try:
-        ckpt = '../input/222222/weights/model_b4_386.ckpt'
+        ckpt = '../input/efefb2b2/weights/model_b4_386.ckpt'
     except:
         print('Set ckpt for evaluation in config.py')
         return
