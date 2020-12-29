@@ -54,7 +54,7 @@ def main():
     warnings.filterwarnings("ignore")
 
     try:
-        ckpt = '../input/efefb2b2/weights/model_b4_386.ckpt'
+        ckpt = '../input/efefb2b2/weights/model_b2_386.ckpt'
     except:
         print('Set ckpt for evaluation in config.py')
         return
